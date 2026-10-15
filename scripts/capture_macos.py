@@ -206,19 +206,32 @@ def shell_commands(line: str):
     return out
 
 
-def makefile_vars(path: str) -> dict:
-    values = {}
+def makefile_vars(path: str):
+    """Return the raw values of MAKEFILE_VARS, and the variables the Makefile
+    exports to its recipes that have a literal value."""
+    values, everything, exported = {}, {}, []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except OSError:
-        return values
+        return values, {}
     joined = re.sub(r"\\\n", " ", text)
     for line in joined.splitlines():
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:?+]?=\s*(.*?)\s*$", line)
-        if m and m.group(1) in MAKEFILE_VARS and m.group(1) not in values:
-            values[m.group(1)] = m.group(2)
-    return values
+        if m and m.group(1) not in everything:
+            everything[m.group(1)] = m.group(2)
+        m = re.match(r"^export\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", line)
+        if m:
+            exported.append(m.group(1))
+    for name in MAKEFILE_VARS:
+        if name in everything:
+            values[name] = everything[name]
+    exports = {
+        name: everything[name]
+        for name in exported
+        if name in everything and "$" not in everything[name]
+    }
+    return values, exports
 
 
 def find_compiles(text: str, cc_tokens, directory: str, root: str):
@@ -355,7 +368,10 @@ def build_command(args) -> None:
     env = dict(os.environ)
     if args.path:
         env["PATH"] = args.path
-    mk = makefile_vars(os.path.join(directory, "Makefile"))
+    mk, exports = makefile_vars(os.path.join(directory, "Makefile"))
+    # make passes these to every recipe, so the compiler saw them; for
+    # example MACOSX_DEPLOYMENT_TARGET sets the deployment-target macros.
+    env.update(exports)
     cc_tokens = shlex.split(mk.get("CC", "cc"))
     with open(args.dry_run, encoding="utf-8", errors="replace") as f:
         dry = f.read()
@@ -421,6 +437,8 @@ def build_command(args) -> None:
             "root": root,
             "compiler": cc_tokens,
             "compiler_path_env": env.get("PATH"),
+            "makefile_exports_applied_to_probes": exports,
+            "probe_env": {k: env.get(k) for k in ["SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "IPHONEOS_DEPLOYMENT_TARGET", "DEVELOPER_DIR"]},
             "makefile_vars": mk,
             "configure_args": (config_status.get("stdout") or "").strip(),
             "config_log_head": config_log_head,
