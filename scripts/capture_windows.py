@@ -28,6 +28,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_common import (  # noqa: E402
     add_common_subcommands,
+    file_facts,
     filtered_env,
     run,
     write_json,
@@ -157,6 +158,21 @@ def env_command(args) -> None:
             "llvm": sorted(os.listdir(os.path.join(path, "VC", "Tools", "Llvm")))
             if os.path.isdir(os.path.join(path, "VC", "Tools", "Llvm")) else [],
         }
+    llvm = {}
+    program_llvm = os.path.expandvars(r"%ProgramFiles%\LLVM\bin")
+    candidates = [("program_files", program_llvm)]
+    for path in toolsets:
+        for sub in ["x64", "ARM64", ""]:
+            candidates.append(("vs:" + (sub or "default"), os.path.join(path, "VC", "Tools", "Llvm", sub, "bin")))
+    for label, bindir in candidates:
+        if not os.path.isdir(bindir):
+            continue
+        llvm[label] = {
+            "bin": bindir,
+            "libclang": file_facts(os.path.join(bindir, "libclang.dll")),
+            "clang_version": first_line(run([os.path.join(bindir, "clang.exe"), "--version"])),
+            "clang_cl_version": first_line(run([os.path.join(bindir, "clang-cl.exe"), "--version"])),
+        }
     sdk_include = sorted(os.listdir(os.path.join(KITS, "Include"))) if os.path.isdir(os.path.join(KITS, "Include")) else []
     sdk_lib = sorted(os.listdir(os.path.join(KITS, "Lib"))) if os.path.isdir(os.path.join(KITS, "Lib")) else []
     msbuild = msbuild_path()
@@ -207,6 +223,7 @@ def env_command(args) -> None:
             "summary": summary,
             "vswhere": installs,
             "toolsets": toolsets,
+            "llvm": llvm,
             "windows_kits": {
                 "root": KITS,
                 "include_versions": sdk_include,
@@ -251,7 +268,8 @@ def parse_cl_lines(log_path: str):
             m = CL_LINE.match(line)
             if not m or ".exe" in m.group("exe").lower()[:-len("\\cl.exe")]:
                 continue
-            args = m.group("args")
+            # The diagnostic logger appends the task's id to each message.
+            args = re.sub(r"\s*\(TaskId:\d+\)$", "", m.group("args"))
             if "/c" not in args.split() and "-c" not in args.split():
                 continue
             invocations.append((m.group("exe"), args))
@@ -335,8 +353,11 @@ def probe(exe, flags, probe_c, empty_c, tmp) -> dict:
     }
     if res.get("returncode") != 0:
         out["stderr"] = res.get("stderr") or res.get("error")
-    # /PD prints every macro definition on compilers that support it.
-    pd = run([exe] + flags + ["/nologo", "/EP", "/PD", "/TC", empty_c], env=env, cwd=tmp)
+    # /PD prints every macro definition, but only with the conforming
+    # preprocessor (/Zc:preprocessor), which also sets _MSVC_TRADITIONAL to 0.
+    pd_flags = [] if "/Zc:preprocessor" in flags else ["/Zc:preprocessor"]
+    pd = run([exe] + flags + pd_flags + ["/nologo", "/EP", "/PD", "/TC", empty_c], env=env, cwd=tmp)
+    out["pd_added_flags"] = pd_flags
     pd_macros = {}
     for line in (pd.get("stdout") or "").splitlines():
         m = re.match(r"^\s*#define\s+(\S+)\s?(.*)$", line)

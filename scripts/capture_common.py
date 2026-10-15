@@ -7,6 +7,7 @@ standard library and avoids newer syntax.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,23 @@ def run(argv, *, env=None, cwd=None, timeout=600, stdin=None) -> dict:
         "returncode": proc.returncode,
         "stdout": proc.stdout.decode("utf-8", "replace"),
         "stderr": proc.stderr.decode("utf-8", "replace"),
+    }
+
+
+def file_facts(path: str) -> dict:
+    """Path, size and sha256 of a file (a library, not a header)."""
+    if not os.path.isfile(path):
+        return {"path": path, "exists": False}
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return {
+        "path": path,
+        "exists": True,
+        "realpath": os.path.realpath(path),
+        "size": os.path.getsize(path),
+        "sha256": digest.hexdigest(),
     }
 
 

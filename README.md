@@ -17,6 +17,7 @@ that holds:
   MSBuild's binary log;
 - the compiler's predefined macros and include search directories for each
   distinct set of flags;
+- the path, size and sha256 of the toolchain's `libclang`;
 - whether the build succeeded.
 
 The test suites are not run. No SDK headers or preprocessed output are
@@ -27,6 +28,11 @@ uploaded: only versions, paths, command lines and macro definitions.
 | `ios.yml` | `build.yml` `build-ios` | `macos-14`, Xcode 15.4 |
 | `macos.yml` | `build.yml` `build-macos`; `jit.yml` and `tail-call.yml` macOS jobs | `macos-26`, `macos-15-intel`, `macos-15` |
 | `windows.yml` | `build.yml` `build-windows` | `windows-2022`, `windows-11-arm` |
+
+`windows.yml` also builds arm64 on `windows-2022`, cross-compiled with Visual
+Studio 2022's x64-hosted ARM64 compiler. That is not a CPython CI job; it is
+there for comparison, because the image `windows-11-arm` now serves ships
+Visual Studio 2026, which v3.14.6's `PCbuild` cannot build with (MSB8020).
 
 The scripts in `scripts/` use only Python's standard library and run on the
 runner's own Python.

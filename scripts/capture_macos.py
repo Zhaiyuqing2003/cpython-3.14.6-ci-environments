@@ -25,6 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from capture_common import (  # noqa: E402
     add_common_subcommands,
+    file_facts,
     filtered_env,
     run,
     write_json,
@@ -120,6 +121,18 @@ def env_command(args) -> None:
             "version": run([cc, "--version"]),
             "dash_v": run([cc, "-E", "-v", "-x", "c", "/dev/null"]),
         }
+    developer = first_line(results["xcode_select_path"]) or ""
+    libclang = {
+        "xcode_toolchain": file_facts(
+            os.path.join(developer, "Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib")
+        ),
+        "command_line_tools": file_facts("/Library/Developer/CommandLineTools/usr/lib/libclang.dylib"),
+    }
+    for cc in args.cc or []:
+        found = first_line(run(["which", cc]))
+        if found:
+            prefix = os.path.dirname(os.path.dirname(os.path.realpath(found)))
+            libclang[cc] = file_facts(os.path.join(prefix, "lib", "libclang.dylib"))
     try:
         xcodes = sorted(n for n in os.listdir("/Applications") if n.startswith("Xcode"))
     except OSError:
@@ -150,6 +163,7 @@ def env_command(args) -> None:
         {
             "summary": summary,
             "applications_xcode": xcodes,
+            "libclang": libclang,
             "commands": results,
             "sdks": sdks,
             "extra_compilers": extra,

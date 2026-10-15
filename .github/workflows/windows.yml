@@ -5,6 +5,10 @@ name: Windows
 # [--disable-gil]` with IncludeUwp=true, on windows-2022 (x64, Win32) and
 # windows-11-arm (arm64). The only addition to the build command is MSBuild's
 # binary logger, which does not change the build. The tests are not run.
+#
+# Two entries are not CPython CI jobs: arm64 cross-compiled on windows-2022
+# (Visual Studio 2022's x64-hosted ARM64 compiler), for comparison with
+# windows-11-arm, whose current image ships Visual Studio 2026.
 
 on:
   workflow_dispatch:
@@ -26,25 +30,31 @@ env:
 jobs:
   build-windows:
     name: >-
-      build-windows (${{ matrix.arch }}${{ matrix.free-threading && ', free-threading' || '' }})
-    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+      build-windows (${{ matrix.arch }}${{ matrix.free-threading && ', free-threading' || '' }}${{ !matrix.ci && ', on windows-2022, not CI' || '' }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, Win32, arm64]
-        free-threading: [false, true]
-        exclude:
-          - { arch: Win32, free-threading: true }
+        include:
+          - { arch: x64, free-threading: false, runner: windows-2022, ci: true }
+          - { arch: x64, free-threading: true, runner: windows-2022, ci: true }
+          - { arch: Win32, free-threading: false, runner: windows-2022, ci: true }
+          - { arch: arm64, free-threading: false, runner: windows-11-arm, ci: true }
+          - { arch: arm64, free-threading: true, runner: windows-11-arm, ci: true }
+          - { arch: arm64, free-threading: false, runner: windows-2022, ci: false }
+          - { arch: arm64, free-threading: true, runner: windows-2022, ci: false }
     env:
       ARCH: ${{ matrix.arch }}
       FT_FLAG: ${{ matrix.free-threading && '--disable-gil' || '' }}
-      JOB_NAME: build-windows-${{ matrix.arch }}${{ matrix.free-threading && '-ft' || '' }}
+      JOB_NAME: build-windows-${{ matrix.arch }}${{ matrix.free-threading && '-ft' || '' }}${{ !matrix.ci && '-on-windows-2022' || '' }}
       MIRRORS: >-
         {"workflow": ".github/workflows/build.yml", "job": "build-windows",
         "reusable": ".github/workflows/reusable-windows.yml",
+        "in_cpython_ci": ${{ matrix.ci }},
         "matrix": {"arch": "${{ matrix.arch }}", "free-threading": ${{ matrix.free-threading }}},
-        "runs_on": "${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}",
+        "runs_on": "${{ matrix.runner }}",
+        "ci_runs_on": "${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}",
         "ci_command": ".\\PCbuild\\build.bat -e -d -v -p ${{ matrix.arch }}${{ matrix.free-threading && ' --disable-gil' || '' }}",
         "ci_env": {"IncludeUwp": "true"}}
     steps:
