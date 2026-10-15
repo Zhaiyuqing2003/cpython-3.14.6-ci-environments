@@ -29,7 +29,7 @@ CPython source directory. It writes into OUT:
   the steps' commands and environments), which the caller completes into
   environment.json.
 
-Only the standard library is used, so it runs on any Python 3.10 or later
+Only the standard library is used, so it runs on any Python 3.11 or later
 the userland has.
 """
 
@@ -63,14 +63,16 @@ SHARED_MODULES = (
 )  # fmt: skip
 # names of variables that may hold credentials, never written out (a run
 # on a GitHub runner uploads the record)
-SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_KEY$|^KEY", re.I)
+SECRET_NAME = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_KEY$|^KEY", re.IGNORECASE
+)
 # cpython_build.NOT_MACRO_FLAGS and NOT_MACRO_PAIRS
 NOT_MACRO_FLAGS = ("-I", "-D", "-U", "-W", "-M", "-o", "-c", "-iquote")
 NOT_MACRO_PAIRS = ("-o", "-MF", "-MT", "-MQ", "-I", "-D", "-U", "-iquote", "-include")
 
 
 def now() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def run(
@@ -105,11 +107,15 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def step(command: list[str], log: str, status: int, env: dict[str, str]) -> dict[str, Any]:
+def step(
+    command: list[str], log: str, status: int, env: dict[str, str]
+) -> dict[str, Any]:
     return {
         "command": command,
         "cwd": str(OUT),
-        "environment": {k: v for k, v in sorted(env.items()) if not SECRET_NAME.search(k)},
+        "environment": {
+            k: v for k, v in sorted(env.items()) if not SECRET_NAME.search(k)
+        },
         "log": log,
         "exit": status,
     }
@@ -124,10 +130,14 @@ def targets() -> list[str]:
     """cpython_build.library and shared_objects: libpython's archive, named
     with the ABI flags, and the shared modules' object files."""
     makefile = (OUT / "Makefile").read_text()
-    out = [f"libpython{makefile_var(makefile, 'VERSION')}{makefile_var(makefile, 'ABIFLAGS')}.a"]
+    out = [
+        f"libpython{makefile_var(makefile, 'VERSION')}{makefile_var(makefile, 'ABIFLAGS')}.a"
+    ]
     for name in SHARED_MODULES:
         m = re.search(
-            rf"^Modules/{re.escape(name)}\$\(EXT_SUFFIX\):([^;\n]*)", makefile, re.MULTILINE
+            rf"^Modules/{re.escape(name)}\$\(EXT_SUFFIX\):([^;\n]*)",
+            makefile,
+            re.MULTILINE,
         )
         if m:
             out += [t for t in m.group(1).split() if t.endswith(".o")]
@@ -199,7 +209,9 @@ def flag_sets(commands: dict[str, list[str]]) -> dict[str, Any]:
             "macros": f"predefined/{key}.h",
             "macros_exit": macros.returncode,
             "verbose": f"predefined/{key}.E-v.txt",
-            "include_dirs": [d.strip() for d in search.group(1).splitlines()] if search else [],
+            "include_dirs": [d.strip() for d in search.group(1).splitlines()]
+            if search
+            else [],
         }
         if "#define __clang__" in macros.stdout:
             frontend = run([*CC, *flags, "-###", "-c", *empty, "-o", "/dev/null"])
@@ -226,13 +238,17 @@ def kernel_view() -> None:
         ("mounts", ["cat", "/proc/self/mounts"]),
     ):
         done = run(command)
-        parts.append(f"==== {title} (exit {done.returncode})\n{done.stdout}{done.stderr}")
+        parts.append(
+            f"==== {title} (exit {done.returncode})\n{done.stdout}{done.stderr}"
+        )
     (OUT / "kernel-view.txt").write_text("\n".join(parts))
 
 
 def packages() -> dict[str, Any]:
     if shutil.which("dpkg-query"):
-        text = output_of(["dpkg-query", "-W", "-f", "${Package}:${Architecture}=${Version}\n"])
+        text = output_of(
+            ["dpkg-query", "-W", "-f", "${Package}:${Architecture}=${Version}\n"]
+        )
     else:
         text = output_of(["apk", "info", "-v"])
     listed = sorted(text.splitlines())
@@ -288,7 +304,10 @@ def libclang(version_text: str) -> dict[str, Any]:
     bindings = ""
     for candidate in (
         "/usr/lib/python3/dist-packages/clang/cindex.py",
-        *[str(p) for p in Path("/usr/lib").glob("python3*/site-packages/clang/cindex.py")],
+        *[
+            str(p)
+            for p in Path("/usr/lib").glob("python3*/site-packages/clang/cindex.py")
+        ],
     ):
         if Path(candidate).is_file():
             bindings = str(Path(candidate).resolve().parent)
@@ -298,7 +317,10 @@ def libclang(version_text: str) -> dict[str, Any]:
         "path": str(library),
         "sha256": sha256_of(library),
         **package_of(library),
-        "bindings": {"path": bindings, **(package_of(Path(bindings)) if bindings else {})},
+        "bindings": {
+            "path": bindings,
+            **(package_of(Path(bindings)) if bindings else {}),
+        },
     }
 
 
@@ -315,14 +337,15 @@ def os_release() -> dict[str, str]:
 
 
 def tools() -> dict[str, str]:
-    first = lambda text: text.splitlines()[0] if text else ""  # noqa: E731
+    first = lambda text: text.splitlines()[0] if text else ""
     return {
         "make": first(output_of(["make", "--version"])),
         "python3": output_of(["python3", "--version"]),
         "capture_python": f"{platform.python_version()} ({sys.executable})",
         "sh": str(Path("/bin/sh").resolve()),
         "binutils": first(output_of(["ld", "--version"])),
-        "libc": first(output_of(["ldd", "--version"])) or first(run(["ldd", "--version"]).stderr),
+        "libc": first(output_of(["ldd", "--version"]))
+        or first(run(["ldd", "--version"]).stderr),
         "pkg-config": output_of(["pkg-config", "--version"]),
         **(
             {"path clang": first(output_of(["clang", "--version"]))}
@@ -344,15 +367,23 @@ def main() -> None:
     command = ["sh", str(SOURCE / "configure"), *SPEC["configure"]]
     done = run(command, "configure.log", env)
     record["configure"] = step(command, "configure.log", done.returncode, env)
-    record["status"] = "configured" if done.returncode == 0 else f"failed: configure exit {done.returncode}"
+    record["status"] = (
+        "configured"
+        if done.returncode == 0
+        else f"failed: configure exit {done.returncode}"
+    )
     if done.returncode == 0 and SPEC.get("prepare"):
         # the JIT's stencils: as many clang processes as Python counts CPUs
-        prepare_env = dict(env, PYTHON_CPU_COUNT=os.environ.get("PYTHON_CPU_COUNT", "4"))
+        prepare_env = dict(
+            env, PYTHON_CPU_COUNT=os.environ.get("PYTHON_CPU_COUNT", "4")
+        )
         command = ["make", *SPEC["prepare"]]
         done = run(command, "prepare.log", prepare_env)
         record["prepare"] = step(command, "prepare.log", done.returncode, prepare_env)
         if done.returncode:
-            record["status"] = f"failed: make {' '.join(SPEC['prepare'])} exit {done.returncode}"
+            record["status"] = (
+                f"failed: make {' '.join(SPEC['prepare'])} exit {done.returncode}"
+            )
     if record["status"] == "configured":
         command = ["make", "-n", *targets()]
         done = run(command, env=env)
@@ -369,7 +400,11 @@ def main() -> None:
             "files": len(commands),
         }
         sets = flag_sets(commands)
-        record["predefined"] = {"folder": "predefined", "index": "predefined/flag-sets.json", "sets": len(sets)}
+        record["predefined"] = {
+            "folder": "predefined",
+            "index": "predefined/flag-sets.json",
+            "sets": len(sets),
+        }
         front_ends = [s["frontend"] for s in sets.values() if "frontend" in s]
         if front_ends:
             record["frontend"] = front_ends
@@ -377,7 +412,10 @@ def main() -> None:
             record["status"] = f"failed: make -n exit {done.returncode}"
     patchlevel = (SOURCE / "Include/patchlevel.h").read_text()
     version = re.search(r'#define PY_VERSION\s+"([^"]+)"', patchlevel)
-    record["cpython"] = {"version": version.group(1) if version else "", "source": str(SOURCE)}
+    record["cpython"] = {
+        "version": version.group(1) if version else "",
+        "source": str(SOURCE),
+    }
     record["finished"] = now()
     (OUT / "environment.part.json").write_text(json.dumps(record, indent=1) + "\n")
     print(record["status"])
