@@ -1,0 +1,99 @@
+name: Windows
+
+# Mirrors the `build-windows` job of CPython 3.14.6's .github/workflows/build.yml
+# (.github/workflows/reusable-windows.yml): `PCbuild\build.bat -e -d -v -p ARCH
+# [--disable-gil]` with IncludeUwp=true, on windows-2022 (x64, Win32) and
+# windows-11-arm (arm64). The only addition to the build command is MSBuild's
+# binary logger, which does not change the build. The tests are not run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/windows.yml
+      - scripts/capture_common.py
+      - scripts/capture_windows.py
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+  IncludeUwp: >-
+    true
+
+jobs:
+  build-windows:
+    name: >-
+      build-windows (${{ matrix.arch }}${{ matrix.free-threading && ', free-threading' || '' }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32, arm64]
+        free-threading: [false, true]
+        exclude:
+          - { arch: Win32, free-threading: true }
+    env:
+      ARCH: ${{ matrix.arch }}
+      FT_FLAG: ${{ matrix.free-threading && '--disable-gil' || '' }}
+      JOB_NAME: build-windows-${{ matrix.arch }}${{ matrix.free-threading && '-ft' || '' }}
+      MIRRORS: >-
+        {"workflow": ".github/workflows/build.yml", "job": "build-windows",
+        "reusable": ".github/workflows/reusable-windows.yml",
+        "matrix": {"arch": "${{ matrix.arch }}", "free-threading": ${{ matrix.free-threading }}},
+        "runs_on": "${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}",
+        "ci_command": ".\\PCbuild\\build.bat -e -d -v -p ${{ matrix.arch }}${{ matrix.free-threading && ' --disable-gil' || '' }}",
+        "ci_env": {"IncludeUwp": "true"}}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+      - name: Output directory
+        shell: bash
+        run: |
+          echo "OUT=$RUNNER_TEMP/ci-env" >> "$GITHUB_ENV"
+          echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_windows.py" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-env/parts"
+
+      - name: Record the environment
+        shell: bash
+        run: python "$CAPTURE" env --out "$OUT/parts/environment.json"
+
+      - name: Build CPython
+        id: build
+        shell: bash
+        run: |
+          set -- .\\PCbuild\\build.bat -e -d -v -p "${ARCH}" ${FT_FLAG} "-bl:${RUNNER_TEMP}\\msbuild.binlog"
+          python "$CAPTURE" step --out "$OUT/steps.jsonl" build -- "$@"
+          "$@"
+
+      - name: Record compile commands and macros
+        if: always()
+        shell: bash
+        run: |
+          python "$CAPTURE" build --root . --binlog "${RUNNER_TEMP}\\msbuild.binlog" \
+            --platform "$ARCH" --configuration Debug \
+            --prop IncludeExternals=true ${FT_FLAG:+--prop DisableGil=true} \
+            --name cpython --out "$OUT/parts/build.json" || echo "::warning::build capture failed"
+          python "$CAPTURE" combine --parts "$OUT/parts" --steps "$OUT/steps.jsonl" \
+            --out "$OUT/environment.json" --cpython-dir . --mirrors "$MIRRORS" \
+            --outcome build=${{ steps.build.outcome }}
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.JOB_NAME }}
+          path: ${{ runner.temp }}/ci-env
+          if-no-files-found: error

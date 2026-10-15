@@ -1,0 +1,345 @@
+name: macOS
+
+# Mirrors CPython 3.14.6's macOS jobs:
+# - build.yml `build-macos` (reusable-macos.yml): macos-26 with and without
+#   --disable-gil, and macos-15-intel;
+# - jit.yml `macos`: macos-15-intel and macos-15, Debug and Release;
+# - tail-call.yml `macos`: macos-15-intel and macos-15.
+# Each job installs and configures as CPython's job does, lists the build's
+# commands with `make -n`, then builds. The tests are not run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/macos.yml
+      - scripts/capture_common.py
+      - scripts/capture_macos.py
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+
+jobs:
+  build-macos:
+    name: >-
+      build-macos (${{ matrix.os }}${{ matrix.free-threading && ', free-threading' || '' }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15-intel]
+        free-threading: [false, true]
+        exclude:
+          - { os: macos-15-intel, free-threading: true }
+    env:
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      PYTHONSTRICTEXTENSIONBUILD: 1
+      TERM: linux
+      FT_FLAG: ${{ matrix.free-threading && '--disable-gil' || '' }}
+      JOB_NAME: build-macos-${{ matrix.os }}${{ matrix.free-threading && '-ft' || '' }}
+      MIRRORS: >-
+        {"workflow": ".github/workflows/build.yml", "job": "build-macos",
+        "reusable": ".github/workflows/reusable-macos.yml",
+        "matrix": {"os": "${{ matrix.os }}", "free-threading": ${{ matrix.free-threading }}},
+        "runs_on": "${{ matrix.os }}"}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+      - name: Output directory
+        run: |
+          echo "OUT=$RUNNER_TEMP/ci-env" >> "$GITHUB_ENV"
+          echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-env/parts"
+
+      # As in CPython's reusable-macos.yml.
+      - name: Install Homebrew dependencies
+        run: |
+          brew bundle --file=Misc/Brewfile
+          brew install make
+          # Because alternate versions are not symlinked into place by default:
+          brew link --overwrite tcl-tk@8
+
+      - name: Record the environment
+        run: python3 "$CAPTURE" env --out "$OUT/parts/environment.json" --sdk macosx
+
+      - name: Configure CPython
+        id: configure
+        run: |
+          set -o pipefail
+          set -- env \
+            MACOSX_DEPLOYMENT_TARGET=10.15 \
+            GDBM_CFLAGS="-I$(brew --prefix gdbm)/include" \
+            GDBM_LIBS="-L$(brew --prefix gdbm)/lib -lgdbm" \
+            ./configure \
+              --config-cache \
+              --with-pydebug \
+              --enable-slower-safety \
+              --enable-safety \
+              ${FT_FLAG} \
+              --prefix=/opt/python-dev \
+              --with-openssl="$(brew --prefix openssl@3.0)"
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" configure -- "$@"
+          "$@" 2>&1 | tee "$OUT/configure.log"
+
+      - name: List the build's commands
+        run: gmake -n > "$OUT/make-n.txt"
+
+      - name: Build CPython
+        id: build
+        run: |
+          set -o pipefail
+          if [ "${{ matrix.os }}" = macos-15-intel ] && [ -z "$FT_FLAG" ]; then
+            set -- gmake -j8 --output-sync
+          else
+            set -- gmake -j8
+          fi
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" build -- "$@"
+          "$@" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Display build info
+        run: make pythoninfo > "$OUT/pythoninfo.txt" 2>&1 || true
+
+      - name: Record compile commands, macros and include directories
+        if: always()
+        run: |
+          python3 "$CAPTURE" build --root . --dir . --name cpython \
+            --dry-run "$OUT/make-n.txt" --build-log "$RUNNER_TEMP/build.log" \
+            --out "$OUT/parts/build.json" || echo "::warning::build capture failed"
+          python3 "$CAPTURE" combine --parts "$OUT/parts" --steps "$OUT/steps.jsonl" \
+            --out "$OUT/environment.json" --cpython-dir . --mirrors "$MIRRORS" \
+            --outcome configure=${{ steps.configure.outcome }} \
+            --outcome build=${{ steps.build.outcome }}
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.JOB_NAME }}
+          path: ${{ runner.temp }}/ci-env
+          if-no-files-found: error
+
+  jit:
+    name: jit (${{ matrix.target }}, ${{ matrix.debug && 'Debug' || 'Release' }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin/clang
+          - aarch64-apple-darwin/clang
+        debug: [true, false]
+        include:
+          - target: x86_64-apple-darwin/clang
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin/clang
+            runner: macos-15
+    env:
+      LLVM_VERSION: 19
+      JOB_NAME: jit-${{ matrix.runner }}-${{ matrix.debug && 'debug' || 'release' }}
+      MIRRORS: >-
+        {"workflow": ".github/workflows/jit.yml", "job": "macos",
+        "matrix": {"target": "${{ matrix.target }}", "debug": ${{ matrix.debug }}},
+        "runs_on": "${{ matrix.runner }}", "llvm": "llvm@19 (Homebrew, after brew update)",
+        "note": "JIT stencils are compiled by Tools/jit/build.py with LLVM 19's clang, outside make; their commands are not in make -n"}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+      - name: Output directory
+        run: |
+          echo "OUT=$RUNNER_TEMP/ci-env" >> "$GITHUB_ENV"
+          echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-env/parts"
+
+      # As in CPython's jit.yml.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+      - name: Install LLVM
+        run: |
+          brew update
+          brew install llvm@${{ env.LLVM_VERSION }}
+
+      - name: Record the environment
+        run: >-
+          python3 "$CAPTURE" env --out "$OUT/parts/environment.json" --sdk macosx
+          --cc "$(brew --prefix llvm@${LLVM_VERSION})/bin/clang"
+
+      - name: Configure CPython
+        id: configure
+        run: |
+          set -o pipefail
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export CFLAGS_JIT='-Werror=unguarded-availability'
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+          set -- ./configure --enable-experimental-jit --enable-universalsdk --with-universal-archs=universal2 ${{ matrix.debug && '--with-pydebug' || '' }}
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" configure -- "$@"
+          "$@" 2>&1 | tee "$OUT/configure.log"
+
+      - name: List the build's commands
+        run: |
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export CFLAGS_JIT='-Werror=unguarded-availability'
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+          make -n all > "$OUT/make-n.txt"
+
+      - name: Build CPython
+        id: build
+        run: |
+          set -o pipefail
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export CFLAGS_JIT='-Werror=unguarded-availability'
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+          set -- make all --jobs 4
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" build -- "$@"
+          "$@" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Record compile commands, macros and include directories
+        if: always()
+        run: |
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export CFLAGS_JIT='-Werror=unguarded-availability'
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+          python3 "$CAPTURE" build --root . --dir . --name cpython \
+            --dry-run "$OUT/make-n.txt" --build-log "$RUNNER_TEMP/build.log" \
+            --out "$OUT/parts/build.json" || echo "::warning::build capture failed"
+          python3 "$CAPTURE" combine --parts "$OUT/parts" --steps "$OUT/steps.jsonl" \
+            --out "$OUT/environment.json" --cpython-dir . --mirrors "$MIRRORS" \
+            --outcome configure=${{ steps.configure.outcome }} \
+            --outcome build=${{ steps.build.outcome }}
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.JOB_NAME }}
+          path: ${{ runner.temp }}/ci-env
+          if-no-files-found: error
+
+  tail-call:
+    name: tail-call (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin/clang
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin/clang
+            runner: macos-15
+    env:
+      LLVM_VERSION: 20
+      JOB_NAME: tail-call-${{ matrix.runner }}
+      MIRRORS: >-
+        {"workflow": ".github/workflows/tail-call.yml", "job": "macos",
+        "matrix": {"target": "${{ matrix.target }}"},
+        "runs_on": "${{ matrix.runner }}", "llvm": "llvm@20 (Homebrew, after brew update)"}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+      - name: Output directory
+        run: |
+          echo "OUT=$RUNNER_TEMP/ci-env" >> "$GITHUB_ENV"
+          echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-env/parts"
+          echo "LLVM_PATH=/opt/homebrew/opt/llvm@${LLVM_VERSION}/bin:/usr/local/opt/llvm@${LLVM_VERSION}/bin:$PATH" >> "$GITHUB_ENV"
+
+      # As in CPython's tail-call.yml.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install llvm@${{ env.LLVM_VERSION }}
+
+      - name: Record the environment
+        run: >-
+          PATH="$LLVM_PATH" python3 "$CAPTURE" env --out "$OUT/parts/environment.json"
+          --sdk macosx --cc clang-${LLVM_VERSION}
+
+      - name: Configure CPython
+        id: configure
+        run: |
+          set -o pipefail
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export PATH="/usr/local/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          export PATH="/opt/homebrew/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          set -- env CC=clang-${{ env.LLVM_VERSION }} ./configure --with-tail-call-interp
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" configure -- "$@"
+          "$@" 2>&1 | tee "$OUT/configure.log"
+
+      - name: List the build's commands
+        run: |
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export PATH="/usr/local/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          export PATH="/opt/homebrew/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          make -n all > "$OUT/make-n.txt"
+
+      - name: Build CPython
+        id: build
+        run: |
+          set -o pipefail
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          export PATH="/usr/local/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          export PATH="/opt/homebrew/opt/llvm@${{ env.LLVM_VERSION }}/bin:$PATH"
+          set -- make all --jobs 4
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" build -- "$@"
+          "$@" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Record compile commands, macros and include directories
+        if: always()
+        run: |
+          export SDKROOT="$(xcrun --show-sdk-path)"
+          python3 "$CAPTURE" build --root . --dir . --name cpython \
+            --dry-run "$OUT/make-n.txt" --build-log "$RUNNER_TEMP/build.log" \
+            --path "$LLVM_PATH" \
+            --out "$OUT/parts/build.json" || echo "::warning::build capture failed"
+          python3 "$CAPTURE" combine --parts "$OUT/parts" --steps "$OUT/steps.jsonl" \
+            --out "$OUT/environment.json" --cpython-dir . --mirrors "$MIRRORS" \
+            --outcome configure=${{ steps.configure.outcome }} \
+            --outcome build=${{ steps.build.outcome }}
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.JOB_NAME }}
+          path: ${{ runner.temp }}/ci-env
+          if-no-files-found: error
