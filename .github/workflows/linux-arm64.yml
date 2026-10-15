@@ -1,0 +1,146 @@
+name: Linux arm64
+
+# Configures two arm64 Linux builds of CPython v3.14.6 on a real
+# ubuntu-24.04-arm runner, to check what QEMU user mode (and QEMU system
+# mode) give against a real kernel and CPU:
+# - linux-aarch64: Ubuntu's clang-20 (20.1.2), ./configure --without-ensurepip;
+# - linux-aarch64-gcc: gcc 13.3.0, as build.yml's `build-ubuntu` on
+#   ubuntu-24.04-arm (which adds --with-pydebug and the safety options).
+# Each is configured twice:
+# - container: in the image linux/ubuntu.Dockerfile builds with the pins in
+#   linux/ubuntu24.04-arm64.json, the same packages as the QEMU runs, so
+#   only the kernel and the CPU differ;
+# - runner: on the runner itself, with the same packages installed at the
+#   same versions over the runner image's own.
+# Nothing is built or tested. Each job uploads the configured outputs
+# (pyconfig.h, Makefile, config.log, ...), `make -n`, the compiler's macros,
+# include directories and front-end options, and what the kernel reports.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    name: configure (${{ matrix.build }}, ${{ matrix.where }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [linux-aarch64, linux-aarch64-gcc]
+        where: [container, runner]
+    env:
+      BUILD: ${{ matrix.build }}
+      WHERE: ${{ matrix.where }}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          path: cpython
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+
+      - name: Build directory and spec
+        run: |
+          out="$RUNNER_TEMP/build/cpython-$BUILD"
+          mkdir -p "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+          python3 - "$out" <<'EOF'
+          import json, os, sys
+          pins = json.load(open("_env/linux/ubuntu24.04-arm64.json"))
+          build = pins["builds"][os.environ["BUILD"]]
+          spec = {
+              "name": os.environ["BUILD"],
+              "compiler": build["compiler"],
+              "configure": build["configure"],
+              "path": [],
+              "prepare": [],
+              "source": os.path.join(os.environ["GITHUB_WORKSPACE"], "cpython"),
+          }
+          with open(os.path.join(sys.argv[1], "capture-spec.json"), "w") as f:
+              json.dump(spec, f, indent=1)
+          EOF
+
+      - name: Record the runner
+        run: |
+          {
+            echo "ImageOS=$ImageOS"
+            echo "ImageVersion=$ImageVersion"
+            echo "RUNNER_ARCH=$RUNNER_ARCH"
+            uname -a
+            cat /etc/os-release
+            nproc
+            free -m
+          } > "$OUT/runner.txt"
+
+      - name: Build the image
+        if: matrix.where == 'container'
+        run: |
+          set -o pipefail
+          mapfile -t args < <(python3 - <<'EOF'
+          import json
+          args = json.load(open("_env/linux/ubuntu24.04-arm64.json"))["image"]["args"]
+          for k, v in args.items():
+              print("--build-arg")
+              print(k + "=" + (" ".join(v) if isinstance(v, list) else v))
+          EOF
+          )
+          docker build --platform linux/arm64 -f _env/linux/ubuntu.Dockerfile \
+            -t ci-env-linux-arm64 --progress plain "${args[@]}" _env/linux \
+            2>&1 | tee "$OUT/image-build.log"
+          docker image inspect ci-env-linux-arm64 > "$OUT/image-inspect.json"
+
+      - name: Configure in the container
+        if: matrix.where == 'container'
+        run: |
+          docker run --rm --network none \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$OUT,dst=$OUT" \
+            -w "$OUT" ci-env-linux-arm64 \
+            python3 "$GITHUB_WORKSPACE/_env/scripts/capture_linux.py" "$OUT"
+
+      - name: Install the same packages on the runner
+        if: matrix.where == 'runner'
+        run: |
+          python3 - > "$RUNNER_TEMP/apt.txt" <<'EOF'
+          import json
+          args = json.load(open("_env/linux/ubuntu24.04-arm64.json"))["image"]["args"]
+          print(args["SNAPSHOT"])
+          print(" ".join(args["APT"]))
+          EOF
+          snapshot="$(sed -n 1p "$RUNNER_TEMP/apt.txt")"
+          packages="$(sed -n 2p "$RUNNER_TEMP/apt.txt")"
+          sudo mkdir -p /etc/apt/sources.list.d.runner
+          sudo sh -c 'mv /etc/apt/sources.list.d/* /etc/apt/sources.list.d.runner/ 2>/dev/null || true'
+          sudo sh -c ': > /etc/apt/sources.list'
+          printf '%s\n' 'Types: deb' "URIs: https://snapshot.ubuntu.com/ubuntu/$snapshot/" \
+            'Suites: noble noble-updates noble-backports noble-security' \
+            'Components: main restricted universe multiverse' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            | sudo tee /etc/apt/sources.list.d/snapshot.sources
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -yq --no-install-recommends \
+            --allow-downgrades install $packages 2>&1 | tee "$OUT/apt-install.log"
+
+      - name: Configure on the runner
+        if: matrix.where == 'runner'
+        working-directory: ${{ env.OUT }}
+        run: python3 "$GITHUB_WORKSPACE/_env/scripts/capture_linux.py" "$OUT"
+
+      - name: Upload the outputs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.build }}-${{ matrix.where }}
+          path: ${{ runner.temp }}/build
+          if-no-files-found: error
