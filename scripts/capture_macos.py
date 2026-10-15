@@ -402,10 +402,21 @@ def build_command(args) -> None:
         flag_sets[keys[key]]["file_count"] += 1
     for fs in flag_sets:
         fs["probes"] = []
-        for arch, flags in split_arches(fs["flags"]):
+        arches = split_arches(fs["flags"])
+        for arch, flags in arches:
             p = probe(cc_tokens, flags, env, directory)
+            dropped = []
+            if p["macros_returncode"] != 0 and len(arches) > 1:
+                # A universal build passes every -m option to every slice;
+                # the driver accepts that, but a single -arch rejects the
+                # other architecture's options (e.g. -mavx2 for arm64).
+                dropped = re.findall(r"unsupported option '([^']+)' for target", p.get("macros_stderr") or "")
+                if dropped:
+                    flags = [f for f in flags if f not in dropped]
+                    p = probe(cc_tokens, flags, env, directory)
             p["arch"] = arch
             p["probe_flags"] = flags
+            p["dropped_for_this_arch"] = dropped
             fs["probes"].append(p)
 
     compare = None

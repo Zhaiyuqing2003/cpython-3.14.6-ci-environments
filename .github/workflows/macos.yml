@@ -28,7 +28,7 @@ jobs:
     name: >-
       build-macos (${{ matrix.os }}${{ matrix.free-threading && ', free-threading' || '' }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -138,7 +138,7 @@ jobs:
   jit:
     name: jit (${{ matrix.target }}, ${{ matrix.debug && 'Debug' || 'Release' }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -245,7 +245,7 @@ jobs:
   tail-call:
     name: tail-call (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
