@@ -1,0 +1,103 @@
+{
+ "note": "The Apple builds apple-parse.yml runs, one job each. kind: which CPython 3.14.6 CI job it follows (ios: build.yml build-ios; macos: build.yml build-macos, reusable-macos.yml; jit: jit.yml macos; tail-call: tail-call.yml macos). runner and xcode: the job's runner label and the Xcode it uses there (select ci: CI selects it with xcode-select; default: CI uses the image's default, which is checked against it). configure, configure_env: the build's own configure options and environment (single-feature builds; CI's extra options, such as --with-pydebug, are left out); make: the job's build command. llvm: the Homebrew llvm@N the job installs. libclang: the parser, beside the build's compiler (xcode: the selected Xcode's toolchain; llvm@20: Homebrew's).",
+ "builds": [
+  {
+   "name": "ios-arm64-simulator",
+   "kind": "ios",
+   "runner": "macos-14",
+   "xcode": "/Applications/Xcode_15.4.app",
+   "select": "ci",
+   "host": "arm64-apple-ios-simulator",
+   "libclang": "xcode",
+   "timeout": 180
+  },
+  {
+   "name": "macos-arm64",
+   "kind": "macos",
+   "runner": "macos-26",
+   "xcode": "/Applications/Xcode_26.6.app",
+   "select": "default",
+   "configure": "--without-ensurepip",
+   "configure_env": "MACOSX_DEPLOYMENT_TARGET=10.15",
+   "make": "gmake -j8",
+   "libclang": "xcode",
+   "timeout": 180
+  },
+  {
+   "name": "macos-arm64-free-threading",
+   "kind": "macos",
+   "runner": "macos-26",
+   "xcode": "/Applications/Xcode_26.6.app",
+   "select": "default",
+   "configure": "--without-ensurepip --disable-gil",
+   "configure_env": "MACOSX_DEPLOYMENT_TARGET=10.15",
+   "make": "gmake -j8",
+   "libclang": "xcode",
+   "timeout": 180
+  },
+  {
+   "name": "macos-x86-64",
+   "kind": "macos",
+   "runner": "macos-15-intel",
+   "xcode": "/Applications/Xcode_16.4.app",
+   "select": "default",
+   "configure": "--without-ensurepip",
+   "configure_env": "MACOSX_DEPLOYMENT_TARGET=10.15",
+   "make": "gmake -j8 --output-sync",
+   "libclang": "xcode",
+   "timeout": 180
+  },
+  {
+   "name": "macos-arm64-jit",
+   "kind": "jit",
+   "runner": "macos-15",
+   "xcode": "/Applications/Xcode_16.4.app",
+   "select": "default",
+   "configure": "--without-ensurepip --enable-experimental-jit --enable-universalsdk --with-universal-archs=universal2",
+   "configure_env": "",
+   "make": "make all --jobs 4",
+   "llvm": "19",
+   "libclang": "xcode",
+   "timeout": 210
+  },
+  {
+   "name": "macos-x86-64-jit",
+   "kind": "jit",
+   "runner": "macos-15-intel",
+   "xcode": "/Applications/Xcode_16.4.app",
+   "select": "default",
+   "configure": "--without-ensurepip --enable-experimental-jit --enable-universalsdk --with-universal-archs=universal2",
+   "configure_env": "",
+   "make": "make all --jobs 4",
+   "llvm": "19",
+   "libclang": "xcode",
+   "timeout": 210
+  },
+  {
+   "name": "macos-arm64-tail-call",
+   "kind": "tail-call",
+   "runner": "macos-15",
+   "xcode": "/Applications/Xcode_16.4.app",
+   "select": "default",
+   "configure": "--without-ensurepip --with-tail-call-interp",
+   "configure_env": "CC=clang-20",
+   "make": "make all --jobs 4",
+   "llvm": "20",
+   "libclang": "llvm@20",
+   "timeout": 180
+  },
+  {
+   "name": "macos-x86-64-tail-call",
+   "kind": "tail-call",
+   "runner": "macos-15-intel",
+   "xcode": "/Applications/Xcode_16.4.app",
+   "select": "default",
+   "configure": "--without-ensurepip --with-tail-call-interp",
+   "configure_env": "CC=clang-20",
+   "make": "make all --jobs 4",
+   "llvm": "20",
+   "libclang": "llvm@20",
+   "timeout": 340
+  }
+ ]
+}

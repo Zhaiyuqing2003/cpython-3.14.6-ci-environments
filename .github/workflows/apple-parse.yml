@@ -1,0 +1,324 @@
+name: Apple parse (encrypted)
+
+# For each Apple build in scripts/apple_builds.json: configure and build
+# CPython 3.14.6 as the matching CI job does, on its runner label with the
+# Xcode it uses, then run an analysis bundle that parses the build with that
+# toolchain's own libclang.
+#
+# The bundle (bundle/extractor.tar.age) is private: it is encrypted with age
+# and decrypted only on the runner, with the EXTRACTOR_IDENTITY secret. Its
+# steps print one status line each; their logs stay on the runner. Everything
+# a job produces, the build records included, is encrypted to
+# bundle/outputs.recipient before it is uploaded, so only ciphertext leaves
+# the runner. No SDK header leaves it in clear form.
+#
+# Started by hand only (workflow_dispatch), e.g.
+#   gh workflow run apple-parse.yml -f builds=ios-arm64-simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      builds:
+        description: Build names from scripts/apple_builds.json, comma-separated, or all
+        required: true
+        default: all
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+  AGE_VERSION: v1.3.2
+  # sha256 of the release tarballs (GitHub's asset digests, checked by hand)
+  AGE_SHA256_ARM64: e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5
+  AGE_SHA256_X64: 1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/apple_builds.json
+          sparse-checkout-cone-mode: false
+      - name: Choose the builds
+        id: plan
+        env:
+          BUILDS: ${{ inputs.builds }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          table = json.load(open("scripts/apple_builds.json"))["builds"]
+          wanted = [w.strip() for w in os.environ["BUILDS"].split(",") if w.strip()]
+          names = [b["name"] for b in table]
+          unknown = [w for w in wanted if w != "all" and w not in names]
+          if unknown or not wanted:
+              sys.exit(f"unknown builds: {unknown}; known: {names}")
+          chosen = [b for b in table if "all" in wanted or b["name"] in wanted]
+          print("matrix=" + json.dumps({"include": chosen}))
+          EOF
+
+  build:
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      BUILD: ${{ matrix.name }}
+      KIND: ${{ matrix.kind }}
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          path: w/reference/cpython
+          persist-credentials: false
+      - name: Check out this repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+
+      - name: Directories
+        run: |
+          W="$GITHUB_WORKSPACE/w"
+          {
+            echo "W=$W"
+            echo "SRC=$W/reference/cpython"
+            echo "BDIR=$W/build/cpython-$BUILD"
+            echo "OUT=$RUNNER_TEMP/out"
+            echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out/capture/parts" "$RUNNER_TEMP/upload" "$W/build/cpython-$BUILD"
+
+      # build.yml's build-ios selects Xcode 15.4; the macOS jobs use the
+      # image's default Xcode, which is checked here against the one the
+      # build pins (and selected when the image has moved on).
+      - name: Select Xcode
+        env:
+          XCODE: ${{ matrix.xcode }}
+          SELECT: ${{ matrix.select }}
+        run: |
+          if [ "$SELECT" = ci ]; then
+            sudo xcode-select --switch "$XCODE"
+          elif [ "$(xcode-select -p)" != "$XCODE/Contents/Developer" ]; then
+            echo "::warning::the image's default Xcode is $(xcode-select -p); selecting $XCODE"
+            sudo xcode-select --switch "$XCODE"
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      # As in CPython's reusable-macos.yml.
+      - name: Install Homebrew dependencies (build-macos)
+        if: matrix.kind == 'macos'
+        working-directory: w/reference/cpython
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew bundle --file=Misc/Brewfile
+          brew install make
+          brew link --overwrite tcl-tk@8
+
+      # As in CPython's jit.yml and tail-call.yml.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        with:
+          python-version: '3.11'
+      - name: Install LLVM (jit, tail-call)
+        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        env:
+          LLVM: ${{ matrix.llvm }}
+        run: |
+          brew update
+          brew install "llvm@$LLVM"
+          if [ "$KIND" = tail-call ]; then
+            echo "/usr/local/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
+            echo "/opt/homebrew/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build environment (jit, tail-call)
+        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        run: |
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          if [ "$KIND" = jit ]; then
+            echo "CFLAGS_JIT=-Werror=unguarded-availability" >> "$GITHUB_ENV"
+            echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install age ${{ env.AGE_VERSION }}
+        run: |
+          case "$(uname -m)" in
+            arm64) arch=arm64; sum="$AGE_SHA256_ARM64" ;;
+            *) arch=amd64; sum="$AGE_SHA256_X64" ;;
+          esac
+          file="age-$AGE_VERSION-darwin-$arch.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" \
+            "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/$file"
+          echo "$sum  $RUNNER_TEMP/$file" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/age"
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP/age" --strip-components=1
+          echo "AGE=$RUNNER_TEMP/age/age" >> "$GITHUB_ENV"
+
+      - name: Decrypt the bundle
+        env:
+          IDENTITY: ${{ secrets.EXTRACTOR_IDENTITY }}
+        run: |
+          set -o pipefail
+          umask 077
+          printf '%s\n' "$IDENTITY" > "$RUNNER_TEMP/identity"
+          "$AGE" -d -i "$RUNNER_TEMP/identity" _env/bundle/extractor.tar.age | tar -x -C "$W"
+          rm -f "$RUNNER_TEMP/identity"
+          echo "bundle: unpacked"
+
+      - name: Python 3.14.6 for the bundle (not on PATH)
+        id: py
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.6'
+          update-environment: false
+
+      - name: Find libclang
+        env:
+          WHICH: ${{ matrix.libclang }}
+          LLVM: ${{ matrix.llvm }}
+        run: |
+          if [ "$WHICH" = xcode ]; then
+            lib="$(dirname "$(dirname "$(xcrun --find clang)")")/lib/libclang.dylib"
+          else
+            lib="$(brew --prefix "llvm@$LLVM")/lib/libclang.dylib"
+          fi
+          ls -l "$lib"
+          shasum -a 256 "$lib"
+          echo "LIBCLANG=$lib" >> "$GITHUB_ENV"
+
+      - name: Record the environment
+        run: |
+          set -- --sdk macosx
+          if [ "$KIND" = ios ]; then set -- "$@" --sdk iphonesimulator --sdk iphoneos; fi
+          if [ "$KIND" = tail-call ]; then set -- "$@" --cc clang-20; fi
+          python3 "$CAPTURE" env --out "$OUT/capture/parts/environment.json" "$@" > /dev/null
+
+      - name: Bundle setup
+        run: >-
+          "${{ steps.py.outputs.python-path }}" "$W/entry.py" setup --build "$BUILD"
+          --python "${{ steps.py.outputs.python-path }}" --libclang "$LIBCLANG" --out "$OUT"
+
+      # build-ios: the build half of `python3 Apple ci iOS --fast-ci`. The
+      # host Python is configured by Apple/__main__.py as CI does (it fetches
+      # the prebuilt dependencies), then again with the same arguments in the
+      # build directory outside the source tree, where it is built.
+      - name: Configure (ios)
+        id: configure_ios
+        if: matrix.kind == 'ios'
+        working-directory: w/reference/cpython
+        env:
+          HOST: ${{ matrix.host }}
+        run: |
+          set -o pipefail
+          python3 Apple clean iOS
+          python3 Apple configure-build 2>&1 | tee "$OUT/capture/configure-build.log"
+          python3 Apple make-build 2>&1 | tail -n 5
+          python3 Apple configure-host iOS "$HOST" 2>&1 | tee "$OUT/capture/configure-host-ci.log"
+          HOST_PATH="$SRC/Apple/iOS/Resources/bin:$SRC/cross-build/$HOST/prefix:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin"
+          echo "HOST_PATH=$HOST_PATH" >> "$GITHUB_ENV"
+          eval "set -- $(sh "cross-build/$HOST/config.status" --config)"
+          cd "$BDIR"
+          python3 "$CAPTURE" step --out "$OUT/capture/steps.jsonl" configure -- "$SRC/configure" "$@"
+          env PATH="$HOST_PATH" "$SRC/configure" "$@" 2>&1 | tee "$OUT/capture/configure.log"
+
+      - name: Configure (macos, jit, tail-call)
+        id: configure
+        if: matrix.kind != 'ios'
+        working-directory: ${{ env.BDIR }}
+        env:
+          OPTIONS: ${{ matrix.configure }}
+          CONFIGURE_ENV: ${{ matrix.configure_env }}
+        run: |
+          set -o pipefail
+          # shellcheck disable=SC2086
+          set -- env $CONFIGURE_ENV "$SRC/configure" $OPTIONS
+          python3 "$CAPTURE" step --out "$OUT/capture/steps.jsonl" configure -- "$@"
+          "$@" 2>&1 | tee "$OUT/capture/configure.log"
+
+      - name: List the build's commands
+        working-directory: ${{ env.BDIR }}
+        run: |
+          if [ "$KIND" = ios ]; then
+            env PATH="$HOST_PATH" make -n > "$OUT/capture/make-n.txt"
+          elif [ "$KIND" = macos ]; then
+            gmake -n > "$OUT/capture/make-n.txt"
+          else
+            make -n all > "$OUT/capture/make-n.txt"
+          fi
+
+      - name: Bundle prepare
+        id: prepare
+        run: >-
+          PATH="${HOST_PATH:+$HOST_PATH:}$PATH" "$W/.venv/bin/python" "$W/entry.py" prepare
+          --build "$BUILD" --src "$SRC" --build-dir "$BDIR" --out "$OUT"
+
+      - name: Build CPython
+        id: make
+        working-directory: ${{ env.BDIR }}
+        env:
+          MAKE_COMMAND: ${{ matrix.make }}
+        run: |
+          set -o pipefail
+          if [ "$KIND" = ios ]; then
+            set -- make -j "$(sysctl -n hw.ncpu)"
+            python3 "$CAPTURE" step --out "$OUT/capture/steps.jsonl" build -- "$@"
+            env PATH="$HOST_PATH" "$@" 2>&1 | tee "$OUT/capture/build.log"
+            env PATH="$HOST_PATH" make install > "$OUT/capture/install.log" 2>&1 || echo "::warning::make install failed"
+          else
+            # shellcheck disable=SC2086
+            set -- $MAKE_COMMAND
+            python3 "$CAPTURE" step --out "$OUT/capture/steps.jsonl" build -- "$@"
+            "$@" 2>&1 | tee "$OUT/capture/build.log"
+          fi
+
+      - name: Record compile commands, macros and include directories
+        if: always()
+        working-directory: ${{ env.BDIR }}
+        run: |
+          python3 "$CAPTURE" build --root "$SRC" --dir . --name cpython \
+            --dry-run "$OUT/capture/make-n.txt" --build-log "$OUT/capture/build.log" \
+            ${HOST_PATH:+--path "$HOST_PATH"} \
+            --out "$OUT/capture/parts/build.json" > /dev/null 2>&1 || echo "::warning::build capture failed"
+          python3 "$CAPTURE" combine --parts "$OUT/capture/parts" --steps "$OUT/capture/steps.jsonl" \
+            --out "$OUT/capture/environment.json" --cpython-dir "$SRC" \
+            --mirrors "{\"build\": \"$BUILD\", \"kind\": \"$KIND\"}" \
+            --outcome configure=${{ steps.configure.outcome == 'skipped' && steps.configure_ios.outcome || steps.configure.outcome }} \
+            --outcome build=${{ steps.make.outcome }} > /dev/null
+
+      - name: Bundle extract
+        if: always() && steps.prepare.outcome == 'success'
+        run: >-
+          PATH="${HOST_PATH:+$HOST_PATH:}$PATH" "$W/.venv/bin/python" "$W/entry.py" extract
+          --build "$BUILD" --src "$SRC" --build-dir "$BDIR" --out "$OUT"
+          --jobs "$(sysctl -n hw.ncpu)"
+
+      - name: Encrypt the outputs
+        if: always()
+        run: |
+          set -o pipefail
+          tar -czf - -C "$OUT" . | "$AGE" -R _env/bundle/outputs.recipient -o "$RUNNER_TEMP/upload/$BUILD.tar.age"
+          ls -l "$RUNNER_TEMP/upload"
+
+      - name: Upload the encrypted outputs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ runner.temp }}/upload/${{ matrix.name }}.tar.age
+          if-no-files-found: error
+          retention-days: 30

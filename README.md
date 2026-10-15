@@ -38,3 +38,26 @@ Visual Studio 2026, which v3.14.6's `PCbuild` cannot build with (MSB8020).
 
 The scripts in `scripts/` use only Python's standard library and run on the
 runner's own Python.
+
+## Encrypted parse of the Apple builds
+
+`apple-parse.yml` runs the Apple builds listed in `scripts/apple_builds.json`.
+For each one it:
+
+- configures and builds CPython `v3.14.6` as the matching CI job does, on
+  the same runner label with the same Xcode (`build-ios` on `macos-14` with
+  Xcode 15.4; `build-macos`, `jit.yml` and `tail-call.yml` on `macos-26`,
+  `macos-15` and `macos-15-intel`);
+- uses each build's own configure options, without CI's extra ones such as
+  `--with-pydebug`;
+- runs a private analysis bundle that parses the build with the
+  toolchain's own `libclang`.
+
+The bundle, `bundle/extractor.tar.age`, is encrypted with
+[age](https://age-encryption.org) v1.3.2 using post-quantum hybrid keys. The
+runner decrypts it with the repository secret `EXTRACTOR_IDENTITY`; its
+steps print one status line each. Everything a job produces, the build
+records included, is encrypted to `bundle/outputs.recipient` before upload,
+so the artifacts hold only ciphertext and no SDK header leaves the runner in
+clear form. Only `workflow_dispatch` runs it, for example
+`gh workflow run apple-parse.yml -f builds=ios-arm64-simulator`.
