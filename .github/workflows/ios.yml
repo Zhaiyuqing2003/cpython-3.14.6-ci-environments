@@ -1,0 +1,140 @@
+name: iOS
+
+# Mirrors the `build-ios` job of CPython 3.14.6's .github/workflows/build.yml:
+# macos-14, Xcode 15.4, `python3 Apple ci iOS --fast-ci`. The build half of
+# `ci --fast-ci` is run step by step (clean, configure and make the build
+# Python, configure and make the arm64 simulator host) so that `make -n` can
+# list each build's commands. The simulator test suite is not run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ios.yml
+      - scripts/capture_common.py
+      - scripts/capture_macos.py
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+
+jobs:
+  build-ios:
+    name: build-ios (macos-14, Xcode 15.4)
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      HOST: arm64-apple-ios-simulator
+      MIRRORS: >-
+        {"workflow": ".github/workflows/build.yml", "job": "build-ios",
+        "runs_on": "macos-14", "xcode_select": "/Applications/Xcode_15.4.app",
+        "ci_command": "python3 Apple ci iOS --fast-ci --simulator 'iPhone SE (3rd generation),OS=17.5'",
+        "replicated": "clean; configure-build; make-build; configure-host iOS arm64-apple-ios-simulator; make-host iOS arm64-apple-ios-simulator (the simulator tests are not run)"}
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          persist-credentials: false
+      - name: Check out the capture scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+      - name: Output directory
+        run: |
+          echo "OUT=$RUNNER_TEMP/ci-env" >> "$GITHUB_ENV"
+          echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-env/parts"
+
+      # As in CPython's build.yml.
+      - name: Select Xcode version
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_15.4.app
+
+      - name: Record the environment
+        run: >-
+          python3 "$CAPTURE" env --out "$OUT/parts/environment.json"
+          --sdk macosx --sdk iphonesimulator --sdk iphoneos
+
+      - name: Clean
+        run: |
+          set -- python3 Apple clean iOS
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" clean -- "$@"
+          "$@"
+
+      - name: Configure the build Python
+        id: configure_build
+        run: |
+          set -o pipefail
+          set -- python3 Apple configure-build
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" configure-build -- "$@"
+          "$@" 2>&1 | tee "$OUT/configure-build.log"
+
+      - name: List the build Python's commands
+        run: |
+          cd cross-build/build
+          make -n > "$OUT/build-python-make-n.txt"
+
+      - name: Compile the build Python
+        id: make_build
+        run: |
+          set -o pipefail
+          set -- python3 Apple make-build
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" make-build -- "$@"
+          "$@" 2>&1 | tee "$RUNNER_TEMP/make-build.log"
+
+      - name: Configure the host Python
+        id: configure_host
+        run: |
+          set -o pipefail
+          set -- python3 Apple configure-host iOS "$HOST"
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" configure-host -- "$@"
+          "$@" 2>&1 | tee "$OUT/configure-host.log"
+
+      # Apple/__main__.py runs make for a host with only PATH replaced
+      # (apple_env); the same PATH is used here.
+      - name: List the host Python's commands
+        run: |
+          HOST_PATH="$GITHUB_WORKSPACE/Apple/iOS/Resources/bin:$GITHUB_WORKSPACE/cross-build/$HOST/prefix:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin"
+          echo "HOST_PATH=$HOST_PATH" >> "$GITHUB_ENV"
+          cd "cross-build/$HOST"
+          env PATH="$HOST_PATH" make -n > "$OUT/host-python-make-n.txt"
+
+      - name: Compile the host Python
+        id: make_host
+        run: |
+          set -o pipefail
+          set -- python3 Apple make-host iOS "$HOST"
+          python3 "$CAPTURE" step --out "$OUT/steps.jsonl" make-host -- "$@"
+          "$@" 2>&1 | tee "$RUNNER_TEMP/make-host.log"
+
+      - name: Record compile commands, macros and include directories
+        if: always()
+        run: |
+          python3 "$CAPTURE" build --root . --dir cross-build/build \
+            --name build-python --dry-run "$OUT/build-python-make-n.txt" \
+            --build-log "$RUNNER_TEMP/make-build.log" \
+            --out "$OUT/parts/build_python.json" || echo "::warning::build-python capture failed"
+          python3 "$CAPTURE" build --root . --dir "cross-build/$HOST" \
+            --name host-python --dry-run "$OUT/host-python-make-n.txt" \
+            --build-log "$RUNNER_TEMP/make-host.log" --path "$HOST_PATH" \
+            --out "$OUT/parts/host_python.json" || echo "::warning::host-python capture failed"
+          python3 "$CAPTURE" combine --parts "$OUT/parts" --steps "$OUT/steps.jsonl" \
+            --out "$OUT/environment.json" --cpython-dir . --mirrors "$MIRRORS" \
+            --outcome configure-build=${{ steps.configure_build.outcome }} \
+            --outcome make-build=${{ steps.make_build.outcome }} \
+            --outcome configure-host=${{ steps.configure_host.outcome }} \
+            --outcome make-host=${{ steps.make_host.outcome }}
+
+      - name: Upload the record
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: build-ios
+          path: ${{ runner.temp }}/ci-env
+          if-no-files-found: error
