@@ -7,7 +7,7 @@ name: Windows
 # binary logger, which does not change the build. The tests are not run.
 #
 # Two entries are not CPython CI jobs: arm64 cross-compiled on windows-2022
-# (Visual Studio 2022's x64-hosted ARM64 compiler), for comparison with
+# (Visual Studio 2022's ARM64 cross compiler), for comparison with
 # windows-11-arm, whose current image ships Visual Studio 2026.
 
 on:
