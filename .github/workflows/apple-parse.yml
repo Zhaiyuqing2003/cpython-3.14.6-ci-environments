@@ -266,7 +266,10 @@ jobs:
           brew update
           # A local bottle includes the exact formula used to build it.
           # --force-bottle prevents a fallback to compiling LLVM from source.
-          brew install --force-bottle "$RUNNER_TEMP"/llvm20/*.bottle*.tar.gz
+          # Homebrew 7 requires an explicit opt-in to local package paths;
+          # scope it to this command, after verifying the bottle above.
+          HOMEBREW_INTERNAL_ALLOW_PACKAGES_FROM_PATHS=1 \
+            brew install --force-bottle "$RUNNER_TEMP"/llvm20/*.bottle*.tar.gz
           echo "/usr/local/opt/llvm@20/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/opt/llvm@20/bin" >> "$GITHUB_PATH"
           cp "$RUNNER_TEMP/llvm20/provenance.json" "$OUT/capture/parts/llvm.json"
