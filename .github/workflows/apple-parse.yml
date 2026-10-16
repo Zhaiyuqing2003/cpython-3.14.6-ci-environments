@@ -117,6 +117,9 @@ jobs:
       - name: Build and bottle Homebrew llvm@20
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
+          # Bottle builds require their dependencies to be installed first
+          # when Homebrew has no bottles for the runner's architecture.
+          brew deps --include-build llvm@20 | xargs brew install --build-from-source
           brew install --build-bottle llvm@20
           mkdir -p "$RUNNER_TEMP/llvm20"
           cd "$RUNNER_TEMP/llvm20"
