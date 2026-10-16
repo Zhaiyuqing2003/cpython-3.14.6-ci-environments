@@ -97,7 +97,7 @@
    "make": "make all --jobs 4",
    "llvm": "20",
    "libclang": "llvm@20",
-   "timeout": 340
+   "timeout": 360
   }
  ]
 }

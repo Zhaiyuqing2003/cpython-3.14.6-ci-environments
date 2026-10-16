@@ -62,9 +62,99 @@ jobs:
           print("matrix=" + json.dumps({"include": chosen}))
           EOF
 
+  llvm20:
+    name: Homebrew llvm@20 (macos-15-intel)
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.matrix).include.*.name, 'macos-x86-64-tail-call')
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    outputs:
+      cache-key: ${{ steps.formula.outputs.cache-key }}
+    env:
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+    steps:
+      - name: Select Xcode
+        run: |
+          XCODE=/Applications/Xcode_16.4.app
+          if [ "$(xcode-select -p)" != "$XCODE/Contents/Developer" ]; then
+            echo "::warning::the image's default Xcode is $(xcode-select -p); selecting $XCODE"
+            sudo xcode-select --switch "$XCODE"
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Identify Homebrew's LLVM formula and runner image
+        id: formula
+        run: |
+          brew update
+          # brew bottle needs the core tap, including the original formula.
+          brew tap --force homebrew/core
+          brew info --json=v2 llvm@20 > "$RUNNER_TEMP/llvm20-formula.json"
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          formula = json.load(open(os.environ["RUNNER_TEMP"] + "/llvm20-formula.json"))["formulae"][0]
+          version = formula["versions"]["stable"]
+          revision = formula["revision"]
+          checksum = formula["ruby_source_checksum"]["sha256"]
+          image = "-".join(os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH"))
+          print(f"cache-key=llvm20-bottle-v1-{version}-{revision}-{image}-{checksum}")
+          EOF
+
+      - name: Look for the locally built bottle
+        id: cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ steps.formula.outputs.cache-key }}
+          lookup-only: true
+
+      # Build Homebrew's own formula, with its options and patches intact.
+      # The separate job gives LLVM and CPython their own six-hour budgets.
+      - name: Build and bottle Homebrew llvm@20
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          brew install --build-bottle llvm@20
+          mkdir -p "$RUNNER_TEMP/llvm20"
+          cd "$RUNNER_TEMP/llvm20"
+          brew bottle --json --skip-relocation llvm@20
+          cp "$RUNNER_TEMP/llvm20-formula.json" formula.json
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          formula = json.load(open("formula.json"))["formulae"][0]
+          bottle, = Path(".").glob("*.bottle*.tar.gz")
+          provenance = {
+              "formula": "llvm@20",
+              "origin": "local build of Homebrew's own formula",
+              "build_command": "brew install --build-bottle llvm@20",
+              "bottle_command": "brew bottle --json --skip-relocation llvm@20",
+              "version": formula["versions"]["stable"],
+              "revision": formula["revision"],
+              "formula_sha256": formula["ruby_source_checksum"]["sha256"],
+              "homebrew_core_commit": formula["tap_git_head"],
+              "build_run_id": os.environ["GITHUB_RUN_ID"],
+              "runner_image": {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")},
+              "bottle": bottle.name,
+              "bottle_sha256": hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest(),
+          }
+          Path("provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          EOF
+
+      - name: Cache the locally built bottle
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ steps.formula.outputs.cache-key }}
+
   build:
     name: ${{ matrix.name }} (${{ matrix.runner }})
-    needs: plan
+    needs: [plan, llvm20]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.llvm20.result == 'success' || needs.llvm20.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -136,7 +226,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install LLVM (jit, tail-call)
-        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        if: (matrix.kind == 'jit' || matrix.kind == 'tail-call') && matrix.name != 'macos-x86-64-tail-call'
         env:
           LLVM: ${{ matrix.llvm }}
         run: |
@@ -146,6 +236,37 @@ jobs:
             echo "/usr/local/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
             echo "/opt/homebrew/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
           fi
+      - name: Restore locally built Homebrew llvm@20
+        if: matrix.name == 'macos-x86-64-tail-call'
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ needs.llvm20.outputs.cache-key }}
+          fail-on-cache-miss: true
+      - name: Install locally built Homebrew llvm@20 without rebuilding
+        if: matrix.name == 'macos-x86-64-tail-call'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          cache = Path(os.environ["RUNNER_TEMP"]) / "llvm20"
+          provenance = json.loads((cache / "provenance.json").read_text())
+          image = {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")}
+          if provenance["runner_image"] != image:
+              raise SystemExit("LLVM cache was built on a different runner image")
+          bottle = cache / provenance["bottle"]
+          if hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest() != provenance["bottle_sha256"]:
+              raise SystemExit("LLVM bottle checksum mismatch")
+          EOF
+          brew update
+          # A local bottle includes the exact formula used to build it.
+          # --force-bottle prevents a fallback to compiling LLVM from source.
+          brew install --force-bottle "$RUNNER_TEMP"/llvm20/*.bottle*.tar.gz
+          echo "/usr/local/opt/llvm@20/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/llvm@20/bin" >> "$GITHUB_PATH"
+          cp "$RUNNER_TEMP/llvm20/provenance.json" "$OUT/capture/parts/llvm.json"
       - name: Build environment (jit, tail-call)
         if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
         run: |
