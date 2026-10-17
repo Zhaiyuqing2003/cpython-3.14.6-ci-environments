@@ -427,14 +427,37 @@ jobs:
             --outcome configure=${{ steps.configure.outcome == 'skipped' && steps.configure_ios.outcome || steps.configure.outcome }} \
             --outcome build=${{ steps.make.outcome }} > /dev/null
 
-      - name: Bundle extract
+      # The private bundle saves each libclang .ast and compiler JSON dump
+      # beneath OUT/ast/BUILD; the encryption step below covers both records.
+      - name: Bundle extract and retain raw AST records
         if: always() && steps.prepare.outcome == 'success'
         run: >-
           PATH="${HOST_PATH:+$HOST_PATH:}$PATH" "$W/.venv/bin/python" "$W/entry.py" extract
           --build "$BUILD" --src "$SRC" --build-dir "$BDIR" --out "$OUT"
           --jobs "$(sysctl -n hw.ncpu)"
 
-      - name: Encrypt the outputs
+      - name: Verify raw AST records are retained
+        if: always() && steps.prepare.outcome == 'success'
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["OUT"]) / "ast" / os.environ["BUILD"]
+          manifest = json.loads((root / "manifest.json").read_text())
+          if not manifest.get("complete") or not manifest.get("units"):
+              raise SystemExit("serialized AST capture incomplete")
+          for source, unit in manifest["units"].items():
+              if not (root / unit["ast"]).is_file():
+                  raise SystemExit("missing serialized AST record")
+              record = manifest.get("compiler_json", {}).get(source)
+              if not record or not (root / record["file"]).is_file():
+                  raise SystemExit("missing compiler JSON record")
+              if hashlib.sha256((root / record["file"]).read_bytes()).hexdigest() != record["gzip_sha256"]:
+                  raise SystemExit("compiler JSON record checksum mismatch")
+          print("raw AST records: retained for encrypted upload")
+          EOF
+
+      - name: Encrypt census, serialized ASTs and compiler JSON outputs
         if: always()
         run: |
           set -o pipefail
