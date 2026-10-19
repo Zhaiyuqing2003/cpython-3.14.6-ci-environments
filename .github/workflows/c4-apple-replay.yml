@@ -257,6 +257,13 @@ jobs:
             | tar -xz -C "$RUNNER_TEMP/replay-input"
           rsync -a "$RUNNER_TEMP/replay-input/w/" "$W/"
           rsync -a "$RUNNER_TEMP/replay-input/out/" "$OUT/"
+          curl -sSfL --retry 5 -o "$RUNNER_TEMP/input-times.tar.age" \
+            "https://github.com/Zhaiyuqing2003/cpython-3.14.6-ci-environments/releases/download/c4-inputs-20261019/input-times.tar.age"
+          "$AGE" -d -i "$RUNNER_TEMP/replay-identity" "$RUNNER_TEMP/input-times.tar.age" \
+            | tar -xz -C "$OUT"
+          if [ "$KIND" = ios ]; then
+            echo "HOST_PATH=$W/reference/cpython/Apple/iOS/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin" >> "$GITHUB_ENV"
+          fi
           echo 'cached inputs: restored'
 
       - name: Replay cached ASTs and capture compiler preprocessing
