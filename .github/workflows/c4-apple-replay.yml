@@ -1,0 +1,507 @@
+name: C4 Apple cached replay (encrypted)
+
+# For each Apple build in scripts/apple_builds.json: configure and build
+# CPython 3.14.6 as the matching CI job does, on its runner label with the
+# Xcode it uses, then run an analysis bundle that parses the build with that
+# toolchain's own libclang.
+#
+# The bundle (bundle/extractor.tar.age) is private: it is encrypted with age
+# and decrypted only on the runner, with the EXTRACTOR_IDENTITY secret. Its
+# steps print one status line each; their logs stay on the runner. Everything
+# a job produces, the build records included, is encrypted to
+# bundle/outputs.recipient before it is uploaded, so only ciphertext leaves
+# the runner. No SDK header leaves it in clear form.
+#
+# Started by hand only (workflow_dispatch), e.g.
+#   gh workflow run apple-parse.yml -f builds=ios-arm64-simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      builds:
+        description: Build names from scripts/apple_builds.json, comma-separated, or all
+        required: true
+        default: all
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+  AGE_VERSION: v1.3.2
+  # sha256 of the release tarballs (GitHub's asset digests, checked by hand)
+  AGE_SHA256_ARM64: e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5
+  AGE_SHA256_X64: 1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/apple_builds.json
+          sparse-checkout-cone-mode: false
+      - name: Choose the builds
+        id: plan
+        env:
+          BUILDS: ${{ inputs.builds }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          table = json.load(open("scripts/apple_builds.json"))["builds"]
+          wanted = [w.strip() for w in os.environ["BUILDS"].split(",") if w.strip()]
+          names = [b["name"] for b in table]
+          unknown = [w for w in wanted if w != "all" and w not in names]
+          if unknown or not wanted:
+              sys.exit(f"unknown builds: {unknown}; known: {names}")
+          chosen = [b for b in table if "all" in wanted or b["name"] in wanted]
+          print("matrix=" + json.dumps({"include": chosen}))
+          EOF
+
+  llvm19:
+    name: Homebrew llvm@19 (macos-15-intel)
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.matrix).include.*.name, 'macos-x86-64-jit')
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    outputs:
+      cache-key: ${{ steps.formula.outputs.cache-key }}
+    env:
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+    steps:
+      - name: Select Xcode
+        run: |
+          XCODE=/Applications/Xcode_16.4.app
+          if [ "$(xcode-select -p)" != "$XCODE/Contents/Developer" ]; then
+            echo "::warning::the image's default Xcode is $(xcode-select -p); selecting $XCODE"
+            sudo xcode-select --switch "$XCODE"
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Identify Homebrew's LLVM formula and runner image
+        id: formula
+        run: |
+          brew update
+          # brew bottle needs the core tap, including the original formula.
+          brew tap --force homebrew/core
+          brew info --json=v2 llvm@19 > "$RUNNER_TEMP/llvm19-formula.json"
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          formula = json.load(open(os.environ["RUNNER_TEMP"] + "/llvm19-formula.json"))["formulae"][0]
+          version = formula["versions"]["stable"]
+          revision = formula["revision"]
+          checksum = formula["ruby_source_checksum"]["sha256"]
+          image = "-".join(os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH"))
+          print(f"cache-key=llvm19-bottle-v1-{version}-{revision}-{image}-{checksum}")
+          EOF
+
+      - name: Look for the locally built bottle
+        id: cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm19
+          key: ${{ steps.formula.outputs.cache-key }}
+          lookup-only: true
+
+      # Build Homebrew's own formula, with its options and patches intact.
+      # The separate job gives LLVM and CPython their own six-hour budgets.
+      - name: Build and bottle Homebrew llvm@19
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Bottle builds require their dependencies to be installed first
+          # when Homebrew has no bottles for the runner's architecture.
+          brew deps --include-build llvm@19 | xargs brew install --build-from-source
+          brew install --build-bottle llvm@19
+          mkdir -p "$RUNNER_TEMP/llvm19"
+          cd "$RUNNER_TEMP/llvm19"
+          brew bottle --json --skip-relocation llvm@19
+          cp "$RUNNER_TEMP/llvm19-formula.json" formula.json
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          formula = json.load(open("formula.json"))["formulae"][0]
+          bottle, = Path(".").glob("*.bottle*.tar.gz")
+          provenance = {
+              "formula": "llvm@19",
+              "origin": "local build of Homebrew's own formula",
+              "build_command": "brew install --build-bottle llvm@19",
+              "bottle_command": "brew bottle --json --skip-relocation llvm@19",
+              "version": formula["versions"]["stable"],
+              "revision": formula["revision"],
+              "formula_sha256": formula["ruby_source_checksum"]["sha256"],
+              "homebrew_core_commit": formula["tap_git_head"],
+              "build_run_id": os.environ["GITHUB_RUN_ID"],
+              "runner_image": {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")},
+              "bottle": bottle.name,
+              "bottle_sha256": hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest(),
+          }
+          Path("provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          EOF
+
+      - name: Cache the locally built bottle
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm19
+          key: ${{ steps.formula.outputs.cache-key }}
+
+  llvm20:
+    name: Homebrew llvm@20 (macos-15-intel)
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.matrix).include.*.name, 'macos-x86-64-tail-call')
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    outputs:
+      cache-key: ${{ steps.formula.outputs.cache-key }}
+    env:
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+    steps:
+      - name: Select Xcode
+        run: |
+          XCODE=/Applications/Xcode_16.4.app
+          if [ "$(xcode-select -p)" != "$XCODE/Contents/Developer" ]; then
+            echo "::warning::the image's default Xcode is $(xcode-select -p); selecting $XCODE"
+            sudo xcode-select --switch "$XCODE"
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Identify Homebrew's LLVM formula and runner image
+        id: formula
+        run: |
+          brew update
+          # brew bottle needs the core tap, including the original formula.
+          brew tap --force homebrew/core
+          brew info --json=v2 llvm@20 > "$RUNNER_TEMP/llvm20-formula.json"
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          formula = json.load(open(os.environ["RUNNER_TEMP"] + "/llvm20-formula.json"))["formulae"][0]
+          version = formula["versions"]["stable"]
+          revision = formula["revision"]
+          checksum = formula["ruby_source_checksum"]["sha256"]
+          image = "-".join(os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH"))
+          print(f"cache-key=llvm20-bottle-v1-{version}-{revision}-{image}-{checksum}")
+          EOF
+
+      - name: Look for the locally built bottle
+        id: cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ steps.formula.outputs.cache-key }}
+          lookup-only: true
+
+      # Build Homebrew's own formula, with its options and patches intact.
+      # The separate job gives LLVM and CPython their own six-hour budgets.
+      - name: Build and bottle Homebrew llvm@20
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Bottle builds require their dependencies to be installed first
+          # when Homebrew has no bottles for the runner's architecture.
+          brew deps --include-build llvm@20 | xargs brew install --build-from-source
+          brew install --build-bottle llvm@20
+          mkdir -p "$RUNNER_TEMP/llvm20"
+          cd "$RUNNER_TEMP/llvm20"
+          brew bottle --json --skip-relocation llvm@20
+          cp "$RUNNER_TEMP/llvm20-formula.json" formula.json
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          formula = json.load(open("formula.json"))["formulae"][0]
+          bottle, = Path(".").glob("*.bottle*.tar.gz")
+          provenance = {
+              "formula": "llvm@20",
+              "origin": "local build of Homebrew's own formula",
+              "build_command": "brew install --build-bottle llvm@20",
+              "bottle_command": "brew bottle --json --skip-relocation llvm@20",
+              "version": formula["versions"]["stable"],
+              "revision": formula["revision"],
+              "formula_sha256": formula["ruby_source_checksum"]["sha256"],
+              "homebrew_core_commit": formula["tap_git_head"],
+              "build_run_id": os.environ["GITHUB_RUN_ID"],
+              "runner_image": {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")},
+              "bottle": bottle.name,
+              "bottle_sha256": hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest(),
+          }
+          Path("provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          EOF
+
+      - name: Cache the locally built bottle
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ steps.formula.outputs.cache-key }}
+
+  build:
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    needs: [plan, llvm19, llvm20]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.llvm19.result == 'success' || needs.llvm19.result == 'skipped') && (needs.llvm20.result == 'success' || needs.llvm20.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      BUILD: ${{ matrix.name }}
+      KIND: ${{ matrix.kind }}
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+    steps:
+      - name: Check out CPython v3.14.6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: v3.14.6
+          path: w/reference/cpython
+          persist-credentials: false
+      - name: Check out this repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: _env
+          persist-credentials: false
+
+      - name: Directories
+        run: |
+          W="$GITHUB_WORKSPACE/w"
+          {
+            echo "W=$W"
+            echo "SRC=$W/reference/cpython"
+            echo "BDIR=$W/build/cpython-$BUILD"
+            echo "OUT=$RUNNER_TEMP/out"
+            echo "CAPTURE=$GITHUB_WORKSPACE/_env/scripts/capture_macos.py"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out/capture/parts" "$RUNNER_TEMP/upload" "$W/build/cpython-$BUILD"
+
+      # build.yml's build-ios selects Xcode 15.4; the macOS jobs use the
+      # image's default Xcode, which is checked here against the one the
+      # build pins (and selected when the image has moved on).
+      - name: Select Xcode
+        env:
+          XCODE: ${{ matrix.xcode }}
+          SELECT: ${{ matrix.select }}
+        run: |
+          if [ "$SELECT" = ci ]; then
+            sudo xcode-select --switch "$XCODE"
+          elif [ "$(xcode-select -p)" != "$XCODE/Contents/Developer" ]; then
+            echo "::warning::the image's default Xcode is $(xcode-select -p); selecting $XCODE"
+            sudo xcode-select --switch "$XCODE"
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      # As in CPython's reusable-macos.yml.
+      - name: Install Homebrew dependencies (build-macos)
+        if: matrix.kind == 'macos'
+        working-directory: w/reference/cpython
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew bundle --file=Misc/Brewfile
+          brew install make
+          brew link --overwrite tcl-tk@8
+
+      # As in CPython's jit.yml and tail-call.yml.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        with:
+          python-version: '3.11'
+      - name: Install LLVM (jit, tail-call)
+        if: (matrix.kind == 'jit' || matrix.kind == 'tail-call') && matrix.name != 'macos-x86-64-tail-call' && matrix.name != 'macos-x86-64-jit'
+        env:
+          LLVM: ${{ matrix.llvm }}
+        run: |
+          brew update
+          brew install "llvm@$LLVM"
+          if [ "$KIND" = tail-call ]; then
+            echo "/usr/local/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
+            echo "/opt/homebrew/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Restore locally built Homebrew llvm@20
+        if: matrix.name == 'macos-x86-64-tail-call'
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm20
+          key: ${{ needs.llvm20.outputs.cache-key }}
+          fail-on-cache-miss: true
+      - name: Install locally built Homebrew llvm@20 without rebuilding
+        if: matrix.name == 'macos-x86-64-tail-call'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          cache = Path(os.environ["RUNNER_TEMP"]) / "llvm20"
+          provenance = json.loads((cache / "provenance.json").read_text())
+          image = {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")}
+          if provenance["runner_image"] != image:
+              raise SystemExit("LLVM cache was built on a different runner image")
+          bottle = cache / provenance["bottle"]
+          if hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest() != provenance["bottle_sha256"]:
+              raise SystemExit("LLVM bottle checksum mismatch")
+          EOF
+          brew update
+          # A local bottle includes the exact formula used to build it.
+          # --force-bottle prevents a fallback to compiling LLVM from source.
+          # Homebrew 7 permits local package paths in developer mode;
+          # scope it to this command, after verifying the bottle above.
+          HOMEBREW_DEVELOPER=1 \
+            brew install --force-bottle "$RUNNER_TEMP"/llvm20/*.bottle*.tar.gz
+          echo "/usr/local/opt/llvm@20/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/opt/llvm@20/bin" >> "$GITHUB_PATH"
+          cp "$RUNNER_TEMP/llvm20/provenance.json" "$OUT/capture/parts/llvm.json"
+      - name: Restore locally built Homebrew llvm@19
+        if: matrix.name == 'macos-x86-64-jit'
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ${{ runner.temp }}/llvm19
+          key: ${{ needs.llvm19.outputs.cache-key }}
+          fail-on-cache-miss: true
+      - name: Install locally built Homebrew llvm@19 without rebuilding
+        if: matrix.name == 'macos-x86-64-jit'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os
+          from pathlib import Path
+          cache = Path(os.environ["RUNNER_TEMP"]) / "llvm19"
+          provenance = json.loads((cache / "provenance.json").read_text())
+          image = {k: os.environ[k] for k in ("ImageOS", "ImageVersion", "RUNNER_ARCH")}
+          if provenance["runner_image"] != image:
+              raise SystemExit("LLVM cache was built on a different runner image")
+          bottle = cache / provenance["bottle"]
+          if hashlib.file_digest(bottle.open("rb"), "sha256").hexdigest() != provenance["bottle_sha256"]:
+              raise SystemExit("LLVM bottle checksum mismatch")
+          EOF
+          brew update
+          # A local bottle includes the exact formula used to build it.
+          # --force-bottle prevents a fallback to compiling LLVM from source.
+          # Homebrew 7 permits local package paths in developer mode;
+          # scope it to this command, after verifying the bottle above.
+          HOMEBREW_DEVELOPER=1 \
+            brew install --force-bottle "$RUNNER_TEMP"/llvm19/*.bottle*.tar.gz
+          cp "$RUNNER_TEMP/llvm19/provenance.json" "$OUT/capture/parts/llvm.json"
+      - name: Build environment (jit, tail-call)
+        if: matrix.kind == 'jit' || matrix.kind == 'tail-call'
+        run: |
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          if [ "$KIND" = jit ]; then
+            echo "CFLAGS_JIT=-Werror=unguarded-availability" >> "$GITHUB_ENV"
+            echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install age ${{ env.AGE_VERSION }}
+        run: |
+          case "$(uname -m)" in
+            arm64) arch=arm64; sum="$AGE_SHA256_ARM64" ;;
+            *) arch=amd64; sum="$AGE_SHA256_X64" ;;
+          esac
+          file="age-$AGE_VERSION-darwin-$arch.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" \
+            "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/$file"
+          echo "$sum  $RUNNER_TEMP/$file" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/age"
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP/age" --strip-components=1
+          echo "AGE=$RUNNER_TEMP/age/age" >> "$GITHUB_ENV"
+
+      - name: Decrypt the bundle
+        env:
+          IDENTITY: ${{ secrets.EXTRACTOR_IDENTITY }}
+        run: |
+          set -o pipefail
+          umask 077
+          printf '%s\n' "$IDENTITY" > "$RUNNER_TEMP/identity"
+          "$AGE" -d -i "$RUNNER_TEMP/identity" _env/bundle/extractor.tar.age | tar -x -C "$W"
+          rm -f "$RUNNER_TEMP/identity"
+          echo "bundle: unpacked"
+
+      - name: Python 3.14.6 for the bundle (not on PATH)
+        id: py
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.6'
+          update-environment: false
+
+      - name: Find libclang
+        env:
+          WHICH: ${{ matrix.libclang }}
+          LLVM: ${{ matrix.llvm }}
+        run: |
+          if [ "$WHICH" = xcode ]; then
+            lib="$(dirname "$(dirname "$(xcrun --find clang)")")/lib/libclang.dylib"
+          else
+            lib="$(brew --prefix "llvm@$LLVM")/lib/libclang.dylib"
+          fi
+          ls -l "$lib"
+          shasum -a 256 "$lib"
+          echo "LIBCLANG=$lib" >> "$GITHUB_ENV"
+
+      - name: Record the environment
+        run: |
+          set -- --sdk macosx
+          if [ "$KIND" = ios ]; then set -- "$@" --sdk iphonesimulator --sdk iphoneos; fi
+          if [ "$KIND" = tail-call ]; then set -- "$@" --cc clang-20; fi
+          python3 "$CAPTURE" env --out "$OUT/capture/parts/environment.json" "$@" > /dev/null
+
+      - name: Bundle setup
+        run: >-
+          "${{ steps.py.outputs.python-path }}" "$W/entry.py" setup --build "$BUILD"
+          --python "${{ steps.py.outputs.python-path }}" --libclang "$LIBCLANG" --out "$OUT"
+
+      - name: Restore encrypted cached inputs
+        env:
+          IDENTITY: ${{ secrets.EXTRACTOR_IDENTITY }}
+        run: |
+          set -o pipefail
+          umask 077
+          printf '%s\n' "$IDENTITY" > "$RUNNER_TEMP/replay-identity"
+          mkdir -p "$RUNNER_TEMP/replay-input"
+          curl -sSfL --retry 5 -o "$RUNNER_TEMP/replay-input.tar.age" \
+            "https://github.com/Zhaiyuqing2003/cpython-3.14.6-ci-environments/releases/download/c4-inputs-20261019/$BUILD.tar.age"
+          "$AGE" -d -i "$RUNNER_TEMP/replay-identity" "$RUNNER_TEMP/replay-input.tar.age" \
+            | tar -xz -C "$RUNNER_TEMP/replay-input"
+          rsync -a "$RUNNER_TEMP/replay-input/w/" "$W/"
+          rsync -a "$RUNNER_TEMP/replay-input/out/" "$OUT/"
+          echo 'cached inputs: restored'
+
+      - name: Replay cached ASTs and capture compiler preprocessing
+        run: >-
+          PATH="${HOST_PATH:+$HOST_PATH:}$PATH" "$W/.venv/bin/python" "$W/entry.py" replay
+          --build "$BUILD" --src "$SRC" --build-dir "$BDIR" --out "$OUT"
+          --jobs 1
+
+      - name: Encrypt replay census and audit evidence
+        if: always()
+        run: |
+          set -o pipefail
+          if [ -f "$OUT/ast/$BUILD/manifest.json" ]; then
+            cp "$OUT/ast/$BUILD/manifest.json" "$OUT/replay-manifest.json"
+          fi
+          tar --exclude='./ast' --exclude='./operators' -czf - -C "$OUT" . \
+            | "$AGE" -R _env/bundle/outputs.recipient -o "$RUNNER_TEMP/upload/$BUILD.tar.age"
+          echo 'replay outputs: encrypted'
+
+      - name: Upload encrypted replay outputs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ runner.temp }}/upload/*.tar.age
+          if-no-files-found: error
+          retention-days: 30
