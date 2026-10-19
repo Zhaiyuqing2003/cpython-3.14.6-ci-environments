@@ -141,7 +141,12 @@ jobs:
         env:
           LLVM: ${{ matrix.llvm }}
         run: |
-          brew install "llvm@$LLVM"
+          brew update
+          if brew list --versions "llvm@$LLVM" > /dev/null 2>&1; then
+            brew reinstall --force-bottle "llvm@$LLVM"
+          else
+            brew install --force-bottle "llvm@$LLVM"
+          fi
           if [ "$KIND" = tail-call ]; then
             echo "/usr/local/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
             echo "/opt/homebrew/opt/llvm@$LLVM/bin" >> "$GITHUB_PATH"
@@ -171,6 +176,7 @@ jobs:
           # --force-bottle prevents a fallback to compiling LLVM from source.
           # Homebrew 7 permits local package paths in developer mode;
           # scope it to this command, after verifying the bottle above.
+          brew update
           HOMEBREW_DEVELOPER=1 \
             brew install --force-bottle "$RUNNER_TEMP"/llvm20/*.bottle*.tar.gz
           echo "/usr/local/opt/llvm@20/bin" >> "$GITHUB_PATH"
